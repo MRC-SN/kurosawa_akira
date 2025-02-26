@@ -34,6 +34,7 @@ mod LayerAkiraExecutor {
 
     use base_trade_component::InternalBaseOrderTradable;
     use sor_trade_component::InternalSORTradable;
+    use kurosawa_akira::SORTradeComponent::SORDetails;
 
     use kurosawa_akira::LayerAkiraCore::{ILayerAkiraCoreDispatcherTrait, ILayerAkiraCoreDispatcher};
 
@@ -42,7 +43,7 @@ mod LayerAkiraExecutor {
     use kurosawa_akira::NonceComponent::{SignedIncreaseNonce, IncreaseNonce};
     use kurosawa_akira::signature::V0OffchainMessage::{OffchainMessageHashImpl};
     use kurosawa_akira::signature::AkiraV0OffchainMessage::{OrderHashImpl,SNIP12MetadataImpl,IncreaseNonceHashImpl,WithdrawHashImpl};
-    use kurosawa_akira::Order::{SignedOrder, Order};
+    use kurosawa_akira::Order::{SignedOrder, Order, SimpleOrder};
     
     
     component!(path: base_trade_component,storage: base_trade_s, event:BaseTradeEvent);
@@ -70,6 +71,7 @@ mod LayerAkiraExecutor {
         self.base_trade_s.core_contract.write(core_address);
         self.base_trade_s.router_contract.write(router_address);
         self.exchange_invokers.write(ILayerAkiraCoreDispatcher {contract_address:core_address }.get_owner(), true);
+        self.sor_trade_s.core_address.write(core_address);
     }
 
     #[external(v0)]
@@ -134,7 +136,8 @@ mod LayerAkiraExecutor {
     #[external(v0)]
     fn apply_single_execution_step(ref self: ContractState, taker_order:SignedOrder, maker_orders: Array<(SignedOrder,u256)>, total_amount_matched:u256, gas_price:u256, cur_gas_per_action:u32,as_taker_completed:bool, ) -> bool {
         assert_whitelisted_invokers(@self);
-        return self.base_trade_s.apply_single_taker(taker_order, maker_orders, total_amount_matched, gas_price, cur_gas_per_action, as_taker_completed, false);
+        let (succ, _) =  self.base_trade_s.apply_single_taker(taker_order, maker_orders.span(), total_amount_matched, gas_price, cur_gas_per_action, as_taker_completed, false, maker_orders.len().try_into().unwrap(), taker_order.order.flags.external_funds, true);
+        return succ;
     }
 
     #[external(v0)]
@@ -145,7 +148,8 @@ mod LayerAkiraExecutor {
         loop {
             match bulk.pop_front(){
                 Option::Some((taker_order, maker_orders, total_amount_matched, as_taker_completed)) => {
-                    res.append(self.base_trade_s.apply_single_taker(taker_order, maker_orders, total_amount_matched, gas_price, cur_gas_per_action, as_taker_completed, false));
+                    let (succ, _) = self.base_trade_s.apply_single_taker(taker_order, maker_orders.span(), total_amount_matched, gas_price, cur_gas_per_action, as_taker_completed, false, maker_orders.len().try_into().unwrap(), taker_order.order.flags.external_funds, true);
+                    res.append(succ);
 
                 },
                 Option::None(_) => {break;}
@@ -165,6 +169,34 @@ mod LayerAkiraExecutor {
     fn fullfillTakerOrder(ref self: ContractState, mut maker_orders:Array<(SignedOrder,u256)>,
                     total_amount_matched:u256, gas_steps:u32, gas_price:u256) {
         assert_whitelisted_invokers(@self); self.sor_trade_s.fullfillTakerOrder(maker_orders, total_amount_matched, gas_steps, gas_price);
+    }
+
+    #[external(v0)]
+    fn placeSORTakerOrder(ref self: ContractState, orchestrate_order: SimpleOrder, path:Array<SimpleOrder>, router_signature:(felt252, felt252), details: SORDetails) {
+        let tx_info = get_tx_info().unbox();
+        if (!self.exchange_invokers.read(tx_info.account_contract_address)) {return;}; // shallow termination for client// argent simulation
+        self.sor_trade_s.placeSOROrder(orchestrate_order, path, router_signature, details);
+    }
+
+    #[external(v0)]
+    fn fulfillSORAtomic(ref self: ContractState, makers_orders:Array<(SignedOrder,u256)>,
+                        total_amount_matched_and_len:Array<(u256, u8)>, gas_steps:u32, gas_price:u256, sor_id:felt252) {
+        assert_whitelisted_invokers(@self); 
+        self.sor_trade_s.fulfillSORAtomic(makers_orders, total_amount_matched_and_len, gas_steps, gas_price, sor_id);           
+    }
+
+    #[external(v0)]
+    fn fulfillSORLeadOrder(ref self: ContractState, sor_id:felt252, makers_orders:Array<(SignedOrder,u256)>,
+            total_amount_matched:u256, gas_steps:u32, gas_price:u256, total_trades:u16) {
+        assert_whitelisted_invokers(@self);
+        self.sor_trade_s.fulfillSORLeadOrder(sor_id, makers_orders, total_amount_matched, gas_steps, gas_price, total_trades);
+
+    }
+    #[external(v0)]
+    fn fulfillSORPath(ref self: ContractState, sor_id:felt252, makers_orders:Array<(SignedOrder,u256)>,
+                    total_amount_matched:u256, gas_steps:u32, gas_price:u256, total_trades:u16) {
+        assert_whitelisted_invokers(@self);
+        self.sor_trade_s.fulfillSORPath(sor_id, makers_orders, total_amount_matched, gas_steps, gas_price, total_trades);
     }
 
     #[derive(Drop, Serde)]

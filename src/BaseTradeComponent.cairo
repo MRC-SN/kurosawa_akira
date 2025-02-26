@@ -147,12 +147,12 @@ mod base_trade_component {
                             total_base += base; total_quote += quote;
                             maker_fill_info.filled_base_amount += base; maker_fill_info.filled_quote_amount += quote; maker_fill_info.last_traded_px = px;
                             taker_fill_info.filled_base_amount += base; taker_fill_info.filled_quote_amount += quote; taker_fill_info.last_traded_px = px;
-                        
+                            maker_fill_info.is_sell_side = !taker_order.flags.is_sell_side;
                             cur += 1;
                         };
                         
                         taker_fill_info.num_trades_happened += trades; taker_fill_info.as_taker_completed = as_taker_completed;
-
+                        taker_fill_info.is_sell_side = taker_order.flags.is_sell_side;
                         self.orders_trade_info.write(taker_hash, taker_fill_info);
                         
                         self.apply_taker_fee_and_gas(taker_order, total_base, total_quote, gas_price, trades, cur_gas_per_action, fee_recipient);
@@ -161,6 +161,7 @@ mod base_trade_component {
                     Option::None(_) => {
                         assert!(taker_orders.len() == 0 && maker_orders.len() == 0 && iters.len() == 0, "MISMATCH");
                         // update state for last maker that gone
+                        
                         self.orders_trade_info.write(maker_hash, maker_fill_info);
                         break();
                     }
@@ -168,13 +169,15 @@ mod base_trade_component {
             };
         }
 
-        fn apply_single_taker(ref self: ComponentState<TContractState>, signed_taker_order:SignedOrder, mut signed_maker_orders:Array<(SignedOrder,u256)>,
-                    total_amount_matched:u256, gas_price:u256,  cur_gas_per_action:u32, as_taker_completed:bool, skip_taker_validation:bool)  -> bool{
+        fn apply_single_taker(ref self: ComponentState<TContractState>, signed_taker_order:SignedOrder, mut signed_maker_orders:Span<(SignedOrder,u256)>,
+                    total_amount_matched:u256, gas_price:u256,  cur_gas_per_action:u32, as_taker_completed:bool, 
+                    skip_taker_validation:bool, gas_trades_to_pay:u16, transfer_taker_recieve_back:bool, allow_charge_gas_on_receipt:bool)  -> (bool, felt252) {
             
             let (exchange, trades): (ContractAddress, u16) = (get_contract_address(), signed_maker_orders.len().try_into().unwrap());
+            // let gas_trades_to_pay = if (skip_gas_pay) {0} else {trades};
             let core = ILayerAkiraCoreDispatcher {contract_address:self.core_contract.read() };
             let fee_recipient = core.get_fee_recipient();
-            let (taker_order, taker_hash, mut taker_fill_info) =  if !signed_taker_order.order.flags.external_funds {
+            let (taker_order, taker_hash, mut __) =  if !signed_taker_order.order.flags.external_funds {
                 self.part_safe_validate_taker(signed_taker_order, trades, fee_recipient)
             } else {
                 let (o, hash, info, available) = self._do_part_external_taker_validate(signed_taker_order, trades, fee_recipient);
@@ -188,74 +191,33 @@ mod base_trade_component {
                 // HOW to deal with PPL that create AA that force exception in implementation?
                 if (!skip_taker_validation && !core.check_sign(taker_order.maker, taker_hash, signed_taker_order.sign, taker_order.sign_scheme)) {0}
                 else {
-                    if !self._prepare_router_taker(taker_order, total_amount_matched, exchange, trades, gas_price, cur_gas_per_action) {0} else {total_amount_matched}
+                    if !self._prepare_router_taker(taker_order, total_amount_matched, exchange, gas_trades_to_pay, gas_price, cur_gas_per_action, allow_charge_gas_on_receipt) {0} else {total_amount_matched}
                 }
             } else {total_amount_matched};
 
-            let core = ILayerAkiraCoreDispatcher {contract_address:self.core_contract.read() };
             let failed = expected_amount_spend == 0;
-            let (mut accum_base, mut accum_quote) = (0,0);
-            loop {
-                match signed_maker_orders.pop_front(){
-                    Option::Some((signed_maker_order, oracle_settle_qty)) => {
-                        // even if external taker fails we must validate makers are correct ones
-                        let (maker_order, maker_hash, mut maker_fill_info) = self.do_internal_maker_checks(signed_maker_order, fee_recipient);
-                        let (amount_base, amount_quote, settle_px) = self.get_settled_amounts(maker_order, taker_order, maker_fill_info, taker_fill_info,oracle_settle_qty, maker_hash);
-                        
-                        if (!taker_order.flags.external_funds && taker_order.constraints.stp != TakerSelfTradePreventionMode::NONE) {
-                            assert!(core.get_signer(maker_order.maker) != core.get_signer(taker_order.maker), "STP_VIOLATED");
-                        }
-                        
-                        if taker_order.flags.external_funds && failed {
-                            self.punish_router_simple(taker_order.fee.gas_fee, taker_order.fee.router_fee.recipient, 
-                                        signed_maker_order.order.maker, taker_order.maker, gas_price, taker_hash, maker_hash, cur_gas_per_action, fee_recipient);
-
-                            self.emit(Trade{
-                                router_maker:maker_order.fee.router_fee.recipient, router_taker:taker_order.fee.router_fee.recipient,
-                                maker:maker_order.maker, taker:taker_order.maker, ticker:maker_order.ticker, is_failed:true, 
-                                is_ecosystem_book:maker_order.flags.to_ecosystem_book, amount_base, amount_quote, is_sell_side:maker_order.flags.is_sell_side, taker_hash, maker_hash, maker_source: maker_order.source, taker_source:taker_order.source });
-                            continue;
-                        }
-
-                        self.settle_trade(maker_order, taker_order, amount_base, amount_quote, maker_hash, taker_hash);
-
-                        maker_fill_info.filled_base_amount += amount_base; maker_fill_info.filled_quote_amount += amount_quote; maker_fill_info.last_traded_px = settle_px;
-                        taker_fill_info.filled_base_amount += amount_base; taker_fill_info.filled_quote_amount += amount_quote; taker_fill_info.last_traded_px = settle_px;
-                        self.orders_trade_info.write(maker_hash, maker_fill_info);
-                        accum_base += amount_base; accum_quote += amount_quote;
-                        
-                    },
-                    Option::None(_) => { 
-                        if taker_order.flags.external_funds && failed {// invalidate order
-                            taker_fill_info.filled_base_amount = taker_order.qty.base_qty;
-                            taker_fill_info.filled_quote_amount = taker_order.qty.quote_qty;
-                        }
-                        taker_fill_info.as_taker_completed = as_taker_completed;
-                        taker_fill_info.num_trades_happened += trades;
-                        self.orders_trade_info.write(taker_hash, taker_fill_info);
-
-                        break();
-                    }
-                }
-            };
-
-            if taker_order.flags.external_funds && failed { return false;}
-            if taker_order.flags.external_funds {
-                let (taker_received, unspent, spent) = if taker_order.flags.is_sell_side {
-                    assert(expected_amount_spend - accum_base  >= 0, 'FINALIZE_BASE_OVERFLOW');                    
-                    (accum_quote, expected_amount_spend - accum_base, accum_base)
-                } else {
-                    assert(expected_amount_spend - accum_quote  >= 0, 'FINALIZE_BASE_OVERFLOW');                    
-                    (accum_base, expected_amount_spend - accum_quote, accum_quote)
-                };
-                // do the reward and pay for the gas, we accumulate all and consume at once, avoiding repetitive actions
-                self.finalize_router_taker(taker_order, taker_hash, taker_received, unspent, gas_price, trades, cur_gas_per_action, spent, fee_recipient);  
-            } else  {
-                self.apply_taker_fee_and_gas(taker_order, accum_base, accum_quote, gas_price, trades, cur_gas_per_action, fee_recipient);    
+            if failed && taker_order.flags.external_funds {
+                // here use trades instead of gas pay trades
+                self.apply_punishment(taker_order, signed_maker_orders, fee_recipient, taker_hash, gas_price, cur_gas_per_action, as_taker_completed);
+                return (false, taker_hash);
             }
 
+            let (accum_base, accum_quote) = self.apply_trades(taker_order, signed_maker_orders, fee_recipient, taker_hash, gas_price, cur_gas_per_action, as_taker_completed);
             
-            return true;     
+            let (taker_received, unspent, spent) = if taker_order.flags.is_sell_side {
+                    if (!taker_order.flags.external_funds) { expected_amount_spend = accum_base}
+                    assert(expected_amount_spend >= accum_base, 'FINALIZE_BASE_OVERFLOW');                    
+                    (accum_quote, expected_amount_spend - accum_base, accum_base)
+                } else {
+                    if (!taker_order.flags.external_funds) { expected_amount_spend = accum_quote}
+                    assert(expected_amount_spend >= accum_quote, 'FINALIZE__OVERFLOW');                    
+                    (accum_base, expected_amount_spend - accum_quote, accum_quote)
+                };
+            self.finalize_router_taker(taker_order, taker_hash, taker_received, unspent, gas_price, 
+                gas_trades_to_pay, cur_gas_per_action, spent, fee_recipient, transfer_taker_recieve_back, taker_order.flags.external_funds); 
+
+
+            return (true, taker_hash);     
         }
 
 
@@ -313,7 +275,7 @@ mod base_trade_component {
             let mut core = ILayerAkiraCoreDispatcher {contract_address:self.core_contract.read() };
             let (fee_token, fee_amount, exchange_fee) = self.apply_fixed_fees(taker_order, base_amount, quote_amount, false);
             let (spent, coin) = super::get_gas_fee_and_coin(taker_order.fee.gas_fee, gas_price, core.get_wrapped_native_token(), cur_gas_per_action, trades);
-            core.transfer(taker_order.maker, fee_recipient, spent, coin);
+            if (spent !=0 ) {core.transfer(taker_order.maker, fee_recipient, spent, coin)};
             return (fee_token, fee_amount, exchange_fee, spent);
         }
 
@@ -369,7 +331,7 @@ mod base_trade_component {
         }
 
         fn _prepare_router_taker(ref self:ComponentState<TContractState>, taker_order:Order, mut out_amount:u256, exchange:ContractAddress, swaps:u16,
-                            gas_price:u256, cur_gas_per_action:u32) -> bool {
+                            gas_price:u256, cur_gas_per_action:u32, allow_charge_gas_from_receipt:bool) -> bool {
             // Prepare taker context for the trade when it have external funds mode
             // 1) Checks if user granted necessary permissions and have enough balance, and nonce of order is correct
             // 2) Tfer necessary amount for the trade and mint tokens on exchange for the user
@@ -387,17 +349,18 @@ mod base_trade_component {
             if !self.can_transfer(exchange, trade_spend_token, taker_order.maker, out_amount) {return false;}
             // if user pay for gas in currency that he receives we omit this step
             // it is job of exchange to ensure that user recieves enough gas tokens to cover costs of swap
-            if gas_token != trade_receive_token && !self.can_transfer(exchange, gas_token, taker_order.maker, spent_gas) {return false;}
+            
+            if (!allow_charge_gas_from_receipt || gas_token != trade_receive_token) && !self.can_transfer(exchange, gas_token, taker_order.maker, spent_gas) {return false;}
             self.transfer_in(exchange, trade_spend_token, taker_order.maker, out_amount);
             
-            if gas_token != trade_receive_token {
+            if (!allow_charge_gas_from_receipt || gas_token != trade_receive_token) {
                 self.transfer_in(exchange, gas_token, taker_order.maker, spent_gas);
             }
             return true;
         }
 
         fn finalize_router_taker(ref self:ComponentState<TContractState>, taker_order:Order, taker_hash:felt252, mut received_amount:u256, unspent_amount:u256, gas_price:u256, trades:u16, cur_gas_per_action:u32,
-                    spent_amount:u256, fee_recipient:ContractAddress) {
+                    spent_amount:u256, fee_recipient:ContractAddress, transfer_back_received:bool, tfer_back_unspent:bool) {
             // Finalize router taker
             // 1) pay for gas, trade, router fee
             // 2) transfer user erc20 tokens that he received + unspent amount of tokens he was selling
@@ -408,12 +371,13 @@ mod base_trade_component {
             // we charged him for gas but we need to deduct before sending back in case it was gas currency he received
             if (taker_order.fee.gas_fee.fee_token != receive_token) {gas = 0}
             
+            
             if (spending_token == fee_token) { //if fees was in token user spend we deduct them from spend to return remaining else from recieve before sending back
-                self.transfer_back(receive_token, taker_order.maker, received_amount - gas);
-                self.transfer_back(spending_token, taker_order.maker, unspent_amount - router_fee_amount - exchange_fee_amount);
+                if transfer_back_received {self.transfer_back(receive_token, taker_order.maker, received_amount - gas);}
+                if tfer_back_unspent {self.transfer_back(spending_token, taker_order.maker, unspent_amount - router_fee_amount - exchange_fee_amount);}
             } else {
-                self.transfer_back(receive_token, taker_order.maker, received_amount - router_fee_amount - exchange_fee_amount - gas);
-                self.transfer_back(spending_token, taker_order.maker, unspent_amount); // tfer unspent amount
+                if transfer_back_received { self.transfer_back(receive_token, taker_order.maker, received_amount - router_fee_amount - exchange_fee_amount - gas);}
+                if tfer_back_unspent {self.transfer_back(spending_token, taker_order.maker, unspent_amount);} // tfer unspent amount
             }
         }
       
@@ -460,6 +424,95 @@ mod base_trade_component {
             let fee_amount = get_feeable_qty(fee, fee_amount, is_maker);
             if fee_amount > 0 { core.transfer(trader, fee.recipient, fee_amount, fee_token);}
             return (fee_token, fee_amount);
+        }
+
+        fn apply_punishment(ref self:ComponentState<TContractState>, 
+                                taker_order:Order, mut signed_maker_orders:Span<(SignedOrder,u256)>, fee_recipient:ContractAddress,
+                                taker_hash:felt252,
+                                gas_price:u256, cur_gas_per_action:u32, as_taker_completed:bool) {
+            let core = ILayerAkiraCoreDispatcher {contract_address:self.core_contract.read() };
+            let mut taker_fill_info = self.orders_trade_info.read(taker_hash);
+            
+            loop {
+                match signed_maker_orders.pop_front(){
+                    Option::Some((signed_maker_order, oracle_settle_qty)) => {
+                        // even if external taker fails we must validate makers are correct ones
+                        let (maker_order, maker_hash, mut maker_fill_info) = self.do_internal_maker_checks(*signed_maker_order, fee_recipient);
+                        let (amount_base, amount_quote, _) = self.get_settled_amounts(maker_order, taker_order, maker_fill_info, taker_fill_info, *oracle_settle_qty, maker_hash);
+                        
+                        if (!taker_order.flags.external_funds && taker_order.constraints.stp != TakerSelfTradePreventionMode::NONE) {
+                            assert!(core.get_signer(maker_order.maker) != core.get_signer(taker_order.maker), "STP_VIOLATED");
+                        }
+                        
+                        self.punish_router_simple(taker_order.fee.gas_fee, taker_order.fee.router_fee.recipient, 
+                            *signed_maker_order.order.maker, taker_order.maker, gas_price, taker_hash, maker_hash, cur_gas_per_action, fee_recipient);
+
+                        self.emit(Trade{router_maker:maker_order.fee.router_fee.recipient, router_taker:taker_order.fee.router_fee.recipient,
+                                maker:maker_order.maker, taker:taker_order.maker, ticker:maker_order.ticker, is_failed:true, 
+                                is_ecosystem_book:maker_order.flags.to_ecosystem_book, amount_base, amount_quote, is_sell_side:maker_order.flags.is_sell_side, taker_hash, 
+                                maker_hash, maker_source: maker_order.source, taker_source:taker_order.source });
+                                              
+                    },
+                    Option::None(_) => { 
+                        // invalidate order
+                        taker_fill_info.filled_base_amount = taker_order.qty.base_qty;
+                        taker_fill_info.filled_quote_amount = taker_order.qty.quote_qty;
+                        taker_fill_info.as_taker_completed = as_taker_completed;
+                        taker_fill_info.is_sell_side = taker_order.flags.is_sell_side;
+                        taker_fill_info.num_trades_happened += signed_maker_orders.len().try_into().unwrap();
+                        self.orders_trade_info.write(taker_hash, taker_fill_info);
+                        break();
+                    }
+                }
+            };
+
+        }
+
+        fn apply_trades(ref self:ComponentState<TContractState>, 
+                                taker_order:Order, mut signed_maker_orders:Span<(SignedOrder,u256)>, fee_recipient:ContractAddress,
+                                taker_hash:felt252,
+                                gas_price:u256, cur_gas_per_action:u32, as_taker_completed:bool) -> (u256, u256) {
+            let core = ILayerAkiraCoreDispatcher {contract_address:self.core_contract.read() };
+            let mut taker_fill_info = self.orders_trade_info.read(taker_hash);
+            let (mut accum_base, mut accum_quote): (u256,u256) = (0,0);
+            loop {
+                match signed_maker_orders.pop_front(){
+                    Option::Some((signed_maker_order, oracle_settle_qty)) => {
+                        // even if external taker fails we must validate makers are correct ones
+                        let (maker_order, maker_hash, mut maker_fill_info) = self.do_internal_maker_checks(*signed_maker_order, fee_recipient);
+                        let (amount_base, amount_quote, settle_px) = self.get_settled_amounts(maker_order, taker_order, maker_fill_info, taker_fill_info, *oracle_settle_qty, maker_hash);
+                        
+                        if (!taker_order.flags.external_funds && taker_order.constraints.stp != TakerSelfTradePreventionMode::NONE) {
+                            assert!(core.get_signer(maker_order.maker) != core.get_signer(taker_order.maker), "STP_VIOLATED");
+                        }
+                        self.settle_trade(maker_order, taker_order, amount_base, amount_quote, maker_hash, taker_hash);
+
+                        maker_fill_info.filled_base_amount += amount_base; maker_fill_info.filled_quote_amount += amount_quote; maker_fill_info.last_traded_px = settle_px;
+                        taker_fill_info.filled_base_amount += amount_base; taker_fill_info.filled_quote_amount += amount_quote; taker_fill_info.last_traded_px = settle_px;
+                        self.orders_trade_info.write(maker_hash, maker_fill_info);
+                        accum_base += amount_base; accum_quote += amount_quote;
+                        maker_fill_info.is_sell_side = !taker_order.flags.is_sell_side;
+                        
+                    },
+                    Option::None(_) => { 
+                        taker_fill_info.as_taker_completed = as_taker_completed;
+                        taker_fill_info.num_trades_happened += signed_maker_orders.len().try_into().unwrap();
+                        taker_fill_info.is_sell_side = taker_order.flags.is_sell_side;
+                        self.orders_trade_info.write(taker_hash, taker_fill_info);
+                        break();
+                    }
+                }
+            };                      
+            (accum_base, accum_quote)
+        }
+
+        fn assert_slippage(self: @ComponentState<TContractState>, taker_hash:felt252, max_spend:u256, min_receive:u256) {
+            let fill_info  = self.get_ecosystem_trade_info(taker_hash);
+            let (spend, received) = if fill_info.is_sell_side {(fill_info.filled_base_amount, fill_info.filled_quote_amount)}
+                                      else {(fill_info.filled_quote_amount,fill_info.filled_base_amount)};
+            assert(max_spend == 0 || spend <= max_spend, 'Failed to max spend');
+            assert(min_receive == 0 || received >= min_receive, 'Failed to min receive');
+            
         }
     }
 
