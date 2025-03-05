@@ -85,6 +85,14 @@ struct Order {
     sign_scheme:felt252 // sign scheme used to sign order
 }
 
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq,Hash)]
+struct SimpleOrder {
+    price: u256, // protection price in quote asset raw amount, for security
+    base_asset: u256,  // omit Quantity since inferred by previous orders
+    ticker: (ContractAddress, ContractAddress), // (base asset address, quote asset address) eg ETH/USDC
+    is_sell_side:bool,
+}
+
 #[derive(Copy, Drop, Serde, PartialEq)]
 struct SignedOrder {
     order: Order,
@@ -98,7 +106,8 @@ struct OrderTradeInfo {
     filled_quote_amount: u256, // filled amount in quote qty
     last_traded_px: u256,
     num_trades_happened: u16,
-    as_taker_completed: bool
+    as_taker_completed: bool,
+    is_sell_side:bool
 }
 
 

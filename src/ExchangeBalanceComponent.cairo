@@ -31,9 +31,6 @@ mod exchange_balance_logic_component {
         Mint:Mint,
         Transfer:Transfer,
         Burn:Burn,
-        FeeReward:FeeReward,
-        Punish:Punish,
-        Trade:Trade
     }
 
     // Debug events
@@ -58,36 +55,6 @@ mod exchange_balance_logic_component {
         amount: u256
     }
 
-
-    #[derive(Drop, starknet::Event)]
-    struct FeeReward {
-        #[key]
-        recipient:ContractAddress,
-        token:ContractAddress,
-        amount:u256,
-    }
-    #[derive(Drop, starknet::Event)]
-    struct Punish {
-        #[key]
-        router:ContractAddress,
-        taker_hash:felt252,
-        maker_hash:felt252,
-        amount:u256,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    struct Trade {
-        #[key]
-        maker:ContractAddress, 
-        #[key]
-        taker:ContractAddress,
-        ticker:(ContractAddress,ContractAddress),
-        router_maker:ContractAddress, router_taker:ContractAddress,
-        amount_base: u256, amount_quote: u256,
-        is_sell_side: bool, is_failed: bool, is_ecosystem_book:bool,
-        maker_hash:felt252, taker_hash:felt252,
-        maker_source:felt252, taker_source:felt252
-    }
 
 
     #[storage]
